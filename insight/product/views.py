@@ -1,0 +1,674 @@
+import os
+import re
+import time
+import logging
+import random
+from collections import defaultdict
+from functools import lru_cache
+from concurrent.futures import ThreadPoolExecutor
+from typing import List, Tuple, Optional
+from urllib.parse import unquote
+
+from rest_framework.views import APIView
+from rest_framework.response import Response
+from rest_framework import status, serializers
+from selenium import webdriver
+from selenium.webdriver.common.by import By
+from selenium.webdriver.edge.options import Options
+from selenium.webdriver.support.ui import WebDriverWait
+from selenium.webdriver.support import expected_conditions as EC
+from selenium.common.exceptions import TimeoutException, NoSuchElementException
+from selenium.webdriver.edge.service import Service as EdgeService
+from transformers import T5ForConditionalGeneration, AutoTokenizer
+import torch
+
+from .models import Product, ProductReview
+from .serializers import ProductSerializer, ProductSearchInputSerializer
+from drf_spectacular.utils import extend_schema
+from dotenv import load_dotenv
+
+load_dotenv()
+
+# ─── LOGGER ───────────────────────────────────────────────────────────────────
+logger = logging.getLogger(__name__)
+
+
+# ─── HELPER ───────────────────────────────────────────────────────────────────
+def format_response(data):
+    if not isinstance(data, list):
+        return [data]
+    return data
+
+
+# ─── MODEL LOADING (once at startup) ──────────────────────────────────────────
+MODEL_PATH = os.getenv(
+    "MODEL_PATH",
+    os.path.join(os.path.dirname(__file__), "t5base")
+)
+model = T5ForConditionalGeneration.from_pretrained(MODEL_PATH, local_files_only=True)
+tokenizer = AutoTokenizer.from_pretrained(MODEL_PATH, local_files_only=True)
+model.eval()
+
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+model = model.to(device)
+
+
+# ─── DEDUPLICATION ────────────────────────────────────────────────────────────
+def deduplicate_prediction(prediction: str) -> str:
+    parts = [part.strip() for part in prediction.split(",") if part.strip()]
+    seen = set()
+    unique_parts = []
+    for part in parts:
+        if part not in seen:
+            seen.add(part)
+            unique_parts.append(part)
+    return ", ".join(unique_parts)
+
+
+# ─── WEBDRIVER MANAGER ────────────────────────────────────────────────────────
+class WebDriverManager:
+    _instance = None
+
+    def __new__(cls):
+        if cls._instance is None:
+            cls._instance = super(WebDriverManager, cls).__new__(cls)
+        return cls._instance
+
+    def __init__(self):
+        if not hasattr(self, '_initialized'):
+            self.edge_options = self._configure_edge_options()
+            self._initialized = True
+
+    @staticmethod
+    def _configure_edge_options():
+        options = Options()
+        options.add_argument("--headless")
+        options.add_argument("--disable-gpu")
+        options.add_argument("--no-sandbox")
+        options.add_argument("--disable-dev-shm-usage")
+        options.add_argument("--window-size=1920,1080")
+        options.add_argument("--disable-blink-features=AutomationControlled")
+        options.add_argument("--ignore-certificate-errors")
+        options.add_argument("--disable-extensions")
+        options.add_experimental_option("excludeSwitches", ["enable-automation"])
+        options.add_experimental_option("useAutomationExtension", False)
+        options.add_argument(
+            "user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/120.0.0.0 Safari/537.36 Edg/148.0.3967.96"
+        )
+        return options
+
+    def get_driver(self):
+        DRIVER_PATH = os.getenv(
+            "EDGE_DRIVER_PATH",
+            r"C:\WebDrivers\msedgedriver.exe"
+        )
+        if not os.path.exists(DRIVER_PATH):
+            raise RuntimeError(
+                f"Edge WebDriver not found at {DRIVER_PATH}. "
+                f"Download version 148.0.3967.96 from: "
+                f"https://developer.microsoft.com/en-us/microsoft-edge/tools/webdriver/"
+            )
+        service = EdgeService(DRIVER_PATH)
+        return webdriver.Edge(service=service, options=self.edge_options)
+
+
+driver_manager = WebDriverManager()
+
+
+# ─── SENTIMENT ANALYSIS ───────────────────────────────────────────────────────
+@lru_cache(maxsize=100)
+def extract_aspect_sentiment_cached(review: str) -> str:
+    input_text = f"aspect-sentiment analysis: {review}"
+    input_encoding = tokenizer(
+        input_text,
+        return_tensors="pt",
+        padding=True,
+        truncation=True,
+        max_length=256
+    ).to(device)
+
+    with torch.no_grad():
+        output_ids = model.generate(
+            input_ids=input_encoding["input_ids"],
+            attention_mask=input_encoding["attention_mask"],
+            max_new_tokens=64,
+            num_beams=4,
+            do_sample=False,
+            early_stopping=True,
+            no_repeat_ngram_size=3,
+            repetition_penalty=2.5,
+        )
+
+    prediction = tokenizer.decode(output_ids[0], skip_special_tokens=True)
+    return deduplicate_prediction(prediction)
+
+
+def extract_aspect_sentiment(reviews: List[str]) -> List[str]:
+    with ThreadPoolExecutor(max_workers=4) as executor:
+        predictions = list(executor.map(extract_aspect_sentiment_cached, reviews))
+    return predictions
+
+
+# ─── WEB SCRAPING ─────────────────────────────────────────────────────────────
+def scrape_product_reviews(product_link: str) -> Tuple[Optional[str], List[str]]:
+    driver = None
+    try:
+        driver = driver_manager.get_driver()
+        driver.get(product_link)
+        time.sleep(random.uniform(3, 5))
+
+        page_title = driver.title.lower()
+        print(f"Page title: {driver.title}")
+
+        # Check if blocked
+        blocked_keywords = ["robot", "captcha", "sorry", "verify", "unusual traffic", "api gateway"]
+        if any(k in page_title for k in blocked_keywords):
+            print("BLOCKED BY AMAZON")
+            return None, ["Amazon blocked the request"]
+
+        # Get product title
+        title_selectors = ["#productTitle", "span#productTitle", "h1#title span", "h1"]
+        product_name = None
+        for selector in title_selectors:
+            try:
+                element = WebDriverWait(driver, 5).until(
+                    EC.presence_of_element_located((By.CSS_SELECTOR, selector))
+                )
+                text = element.text.strip()
+                if text:
+                    product_name = text
+                    print(f"Found product name: {product_name[:60]}")
+                    break
+            except TimeoutException:
+                continue
+
+        if not product_name:
+            return None, ["Could not locate the product title"]
+
+        # ─── STRATEGY 1: Scroll down and find inline reviews ──
+        print("Scrolling to load inline reviews on product page...")
+        for scroll_pct in [0.3, 0.5, 0.7, 0.9, 1.0]:
+            driver.execute_script(
+                f"window.scrollTo(0, document.body.scrollHeight * {scroll_pct});"
+            )
+            time.sleep(1)
+
+        # ─── STRATEGY 2: Find and click the reviews section ───
+        try:
+            reviews_section = driver.find_element(
+                By.CSS_SELECTOR,
+                '#reviews-medley-cmps-expand-head, '
+                '#reviewsMedley, '
+                '#customerReviews, '
+                '[data-hook="reviews-medley-cmps-expand-head"]'
+            )
+            driver.execute_script("arguments[0].scrollIntoView();", reviews_section)
+            time.sleep(1)
+            print("Found reviews section on product page")
+        except Exception:
+            print("No reviews section anchor found, continuing with page scrape")
+
+        # ─── STRATEGY 3: Debug what data-hooks are available ──
+        # elements = driver.find_elements(By.CSS_SELECTOR, '[data-hook]')
+        # hooks = set([el.get_attribute('data-hook') for el in elements])
+        # print(f"Available data-hooks on product page: {hooks}")
+
+        # ─── TRY ALL KNOWN REVIEW SELECTORS ───────────────────
+        review_selectors = [
+            # Inline product page review selectors
+            'span[data-hook="reviewText"]',          # ← exact hook from your debug
+            'div[data-hook="reviewTextContainer"]',   # ← exact hook from your debug
+            'div[data-hook="reviewRichContentContainer"]',
+            'div[data-hook="review"]',
+            'div[data-hook="review-collapsed"]',
+            'span[data-hook="review-body"]',
+            'div[data-hook="review-body"]',
+            '[data-hook="review-star-rating"] ~ div span',
+            # CSS class selectors
+            '.review-text-content span',
+            '.review-text span',
+            '.reviewText span',
+            'span.cr-original-review-content',
+            '.a-expander-content p',
+            # Broader fallback
+            '#cm_cr-review_list .review',
+            '.customer-reviews-content',
+        ]
+
+        review_elements = []
+        for selector in review_selectors:
+            try:
+                found = WebDriverWait(driver, 5).until(
+                    EC.presence_of_all_elements_located((By.CSS_SELECTOR, selector))
+                )
+                if found:
+                    print(f"Found {len(found)} elements with: {selector}")
+                    review_elements = found
+                    break
+            except TimeoutException:
+                continue
+
+        # ─── STRATEGY 4: Extract from full page text blocks ───
+        if not review_elements:
+            print("Trying full page text extraction...")
+            # Get all text from page and filter review-like content
+            all_spans = driver.find_elements(By.TAG_NAME, 'span')
+            all_paras = driver.find_elements(By.TAG_NAME, 'p')
+            all_divs  = driver.find_elements(By.TAG_NAME, 'div')
+
+            candidates = all_spans + all_paras
+            review_elements = [
+                el for el in candidates
+                if el.text and 20 < len(el.text.strip()) < 1000
+            ]
+            print(f"Full page extraction found {len(review_elements)} candidates")
+
+        # ─── CLEAN AND FILTER ─────────────────────────────────
+        skip_keywords = [
+            'sign in to see', 'write a review', 'filter by',
+            'sort by', 'report abuse', 'see more reviews',
+            'top reviews from', 'sponsored', 'back to top',
+            'add to cart', 'add to wish', 'secure transaction',
+            'ships from', 'sold by', 'return policy',
+            'free delivery', 'javascript required',
+        ]
+
+        reviews = []
+        seen = set()
+        for el in review_elements:
+            text = " ".join(el.text.split())
+            if (text
+                    and len(text) > 20
+                    and text not in seen
+                    and not any(kw in text.lower() for kw in skip_keywords)):
+                seen.add(text)
+                reviews.append(text)
+
+        print(f"Total clean reviews: {len(reviews)}")
+        # if reviews:
+        #     for i, r in enumerate(reviews[:3]):
+        #         print(f"  Review {i+1}: {r[:80]}")
+
+        if not reviews:
+            return product_name, ["No customer reviews found on page"]
+
+        return product_name, reviews
+
+    except TimeoutException as e:
+        return None, [f"Timeout: {str(e)}"]
+    except Exception as e:
+        print(f"Scraping error: {str(e)}")
+        return None, [f"Scraping error: {str(e)}"]
+    finally:
+        if driver:
+            driver.quit()
+
+
+# ─── SUMMARY GENERATOR ────────────────────────────────────────────────────────
+def generate_summary(extracted_aspects: List[str]) -> str:
+    aspect_sentiment_count = defaultdict(lambda: defaultdict(int))
+
+    def normalize_sentiment(sentiment: str) -> str:
+        sentiment = sentiment.strip().lower()
+        if "extremely positive" in sentiment:
+            return "extremely positive"
+        elif "extremely negative" in sentiment:
+            return "extremely negative"
+        elif "positive" in sentiment:
+            return "positive"
+        elif "negative" in sentiment:
+            return "negative"
+        elif "conflict" in sentiment:
+            return "conflict"
+        return "neutral"
+
+    for aspect_string in extracted_aspects:
+        for part in aspect_string.split(", "):
+            if ":" in part:
+                try:
+                    aspect, sentiment = part.rsplit(": ", 1)
+                    aspect = aspect.strip().upper()
+                    normalized = normalize_sentiment(sentiment)
+                    aspect_sentiment_count[aspect][normalized] += 1
+                except Exception:
+                    continue
+
+    def classify(sentiments: dict) -> str:
+        total = sum(sentiments.values())
+        if total == 0:
+            return None
+        ext_pos = (sentiments.get("extremely positive", 0) / total) * 100
+        pos     = (sentiments.get("positive", 0) / total) * 100
+        neg     = (sentiments.get("negative", 0) / total) * 100
+        ext_neg = (sentiments.get("extremely negative", 0) / total) * 100
+        conflict = (sentiments.get("conflict", 0) / total) * 100
+
+        if conflict > 20:
+            return "conflicting"
+        elif ext_pos > 30:
+            return "very positive"
+        elif ext_neg > 30:
+            return "very negative"
+        elif (pos + ext_pos) > (neg + ext_neg + 10):
+            return "positive"
+        elif (neg + ext_neg) > (pos + ext_pos + 10):
+            return "negative"
+        elif total > 0:
+            return "mixed"
+        return None
+
+    categories = {
+        "very positive": [], "positive": [],
+        "negative": [],      "very negative": [],
+        "mixed": [],         "conflicting": []
+    }
+    for aspect, sentiments in aspect_sentiment_count.items():
+        cat = classify(sentiments)
+        if cat:
+            categories[cat].append(aspect)
+
+    parts = []
+    if categories["very positive"]:
+        parts.append(f"Users were extremely enthusiastic about the {', '.join(categories['very positive'])}.")
+    if categories["positive"]:
+        parts.append(f"Many users found the {', '.join(categories['positive'])} to be good.")
+    if categories["mixed"]:
+        parts.append(f"Opinions on the {', '.join(categories['mixed'])} were mixed.")
+    if categories["conflicting"]:
+        parts.append(f"There were conflicting views about the {', '.join(categories['conflicting'])}.")
+    if categories["negative"]:
+        parts.append(f"Users reported issues with the {', '.join(categories['negative'])}.")
+    if categories["very negative"]:
+        parts.append(f"Users expressed strong concerns about the {', '.join(categories['very negative'])}.")
+
+    return " ".join(parts) if parts else "No clear sentiment patterns found."
+
+
+# ─── NORMALIZE SENTIMENT (shared helper) ──────────────────────────────────────
+def normalize_sentiment(sentiment: str) -> str:
+    sentiment = sentiment.strip().lower()
+    if "extremely positive" in sentiment:
+        return "extremely positive"
+    elif "extremely negative" in sentiment:
+        return "extremely negative"
+    elif "positive" in sentiment:
+        return "positive"
+    elif "negative" in sentiment:
+        return "negative"
+    elif "conflict" in sentiment:
+        return "conflict"
+    return "neutral"
+
+
+# ─── VIEWS ────────────────────────────────────────────────────────────────────
+class ProductSearchOrScrapeView(APIView):
+
+    @extend_schema(
+        request=ProductSearchInputSerializer,
+        responses={200: ProductSerializer},
+    )
+    def post(self, request):
+        print("REQUEST DATA:", request.data)        # ← add this
+        # print("REQUEST BODY:", request.body)        # ← add this
+        user_input = request.data.get("input", "").strip()
+
+        if not user_input:
+            return Response(
+                {"error": "Input is required"},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+
+        print(user_input)
+
+        if user_input.startswith(("http://", "https://")):
+            user_input = unquote(user_input)
+            print(user_input)
+            return self._handle_url_query(user_input)
+
+        return self._handle_search_query(user_input)
+
+    # ------------------------------------------------------------------
+    def _handle_url_query(self, url: str) -> Response:
+        try:
+            product_name, reviews = scrape_product_reviews(url)
+
+            if product_name is None:
+                return Response(
+                    {"error": reviews[0] if reviews else "Failed to scrape product details"},
+                    status=status.HTTP_400_BAD_REQUEST
+                )
+
+            product, _ = Product.objects.get_or_create(name=product_name)
+
+            existing_reviews = set(
+                ProductReview.objects.filter(product=product)
+                .values_list("review_text", flat=True)
+            )
+            new_reviews = [
+                ProductReview(product=product, review_text=r)
+                for r in reviews if r not in existing_reviews
+            ]
+            if new_reviews:
+                ProductReview.objects.bulk_create(new_reviews)
+
+            # Aspect extraction in batches
+            batch_size = 10
+            all_extracted_aspects = []
+            for i in range(0, len(reviews), batch_size):
+                batch = reviews[i:i + batch_size]
+                all_extracted_aspects.extend(extract_aspect_sentiment(batch))
+
+            summary_text = generate_summary(all_extracted_aspects)
+
+            return Response({
+                "products": format_response([{
+                    "id": product.id,
+                    "name": product.name,
+                    "reviews": reviews,
+                    "extracted_aspects": all_extracted_aspects,
+                    "summary_text": summary_text
+                }])
+            }, status=status.HTTP_200_OK)
+
+        except RuntimeError as e:
+            return Response(
+                {"error": f"Web scraping unavailable: {str(e)}"},
+                status=status.HTTP_503_SERVICE_UNAVAILABLE
+            )
+        except Exception as e:
+            return Response(
+                {"error": f"Failed to process URL: {str(e)}"},
+                status=status.HTTP_500_INTERNAL_SERVER_ERROR
+            )
+
+    # ------------------------------------------------------------------
+    def _handle_search_query(self, query: str) -> Response:
+        try:
+            products = Product.objects.filter(name__icontains=query)
+
+            if not products.exists():
+                return Response(
+                    {"message": "No matching products found."},
+                    status=status.HTTP_404_NOT_FOUND
+                )
+
+            product_data = []
+
+            for product in products:
+                reviews = list(
+                    ProductReview.objects.filter(product=product)
+                    .values_list("review_text", flat=True)
+                )
+
+                extracted_aspects = extract_aspect_sentiment(reviews) if reviews else []
+
+                # Count aspect sentiments
+                aspect_sentiment_counts = defaultdict(lambda: defaultdict(int))
+                for aspect_string in extracted_aspects:
+                    for part in aspect_string.split(", "):
+                        if ":" in part:
+                            try:
+                                aspect, sentiment = part.rsplit(": ", 1)
+                                aspect = aspect.strip()
+                                aspect_sentiment_counts[aspect][normalize_sentiment(sentiment)] += 1
+                            except Exception:
+                                continue
+
+                serializable_counts = {
+                    aspect: dict(sentiments)
+                    for aspect, sentiments in aspect_sentiment_counts.items()
+                }
+
+                summary_text = (
+                    generate_summary(extracted_aspects)
+                    if reviews else "No reviews available for sentiment analysis."
+                )
+
+                product_info = ProductSerializer(product).data
+                product_info.update({
+                    "reviews": reviews,
+                    "extracted_aspects": extracted_aspects,
+                    "aspect_sentiment_counts": serializable_counts,
+                    "summary_text": summary_text,
+                })
+                product_data.append(product_info)
+
+            return Response({"products": product_data}, status=status.HTTP_200_OK)
+
+        except Exception as e:
+            return Response(
+                {"error": f"Search failed: {str(e)}"},
+                status=status.HTTP_500_INTERNAL_SERVER_ERROR
+            )
+
+
+# ─── TEST ENDPOINT ────────────────────────────────────────────────────────────
+class ReviewInputSerializer(serializers.Serializer):
+    reviews = serializers.ListField(
+        child=serializers.CharField(),
+        help_text="A list of review texts to analyze."
+    )
+
+
+class AspectSentimentOutputSerializer(serializers.Serializer):
+    predictions = serializers.ListField(
+        child=serializers.CharField(),
+        help_text="A list of aspect-sentiment predictions."
+    )
+
+
+class AspectSentimentAnalysisView(APIView):
+
+    @extend_schema(
+        request=ReviewInputSerializer,
+        responses={200: AspectSentimentOutputSerializer},
+    )
+    def post(self, request, *args, **kwargs):
+        serializer = ReviewInputSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        reviews = serializer.validated_data["reviews"]
+        predictions = extract_aspect_sentiment(reviews)
+        return Response({"predictions": predictions}, status=status.HTTP_200_OK)
+
+
+# ─── PRODUCT DETAIL ───────────────────────────────────────────────────────────
+class ProductDetailView(APIView):
+
+    def get(self, request, product_id):
+        try:
+            product = Product.objects.get(id=product_id)
+        except Product.DoesNotExist:
+            return Response(
+                {"error": "Product not found."},
+                status=status.HTTP_404_NOT_FOUND
+            )
+        except Exception as e:
+            logger.error(f"Unexpected error fetching product: {str(e)}")
+            return Response(
+                {"error": "An unexpected error occurred while retrieving the product."},
+                status=status.HTTP_500_INTERNAL_SERVER_ERROR
+            )
+
+        try:
+            reviews = list(
+                ProductReview.objects.filter(product=product)
+                .values_list("review_text", flat=True)
+            )
+        except Exception as e:
+            logger.error(f"Error fetching reviews: {str(e)}")
+            return Response(
+                {"error": "An error occurred while fetching product reviews."},
+                status=status.HTTP_500_INTERNAL_SERVER_ERROR
+            )
+
+        extracted_aspects = []
+        aspect_sentiment_counts = defaultdict(lambda: defaultdict(int))
+
+        if reviews:
+            try:
+                extracted_aspects = extract_aspect_sentiment(reviews)
+                for aspect_string in extracted_aspects:
+                    for part in aspect_string.split(", "):
+                        if ":" in part:
+                            try:
+                                aspect, sentiment = part.rsplit(": ", 1)
+                                aspect = aspect.strip()
+                                aspect_sentiment_counts[aspect][normalize_sentiment(sentiment)] += 1
+                            except ValueError:
+                                logger.warning(f"Skipping malformed aspect entry: {part}")
+                                continue
+            except Exception as e:
+                logger.error(f"Error extracting aspect sentiments: {str(e)}")
+                return Response(
+                    {"error": "An error occurred while extracting aspect sentiments."},
+                    status=status.HTTP_500_INTERNAL_SERVER_ERROR
+                )
+
+        serializable_counts = {
+            aspect: dict(sentiments)
+            for aspect, sentiments in aspect_sentiment_counts.items()
+        }
+
+        product_info = ProductSerializer(product).data
+        product_info.update({
+            "reviews": reviews,
+            "extracted_aspects": extracted_aspects,
+            "aspect_sentiment_counts": serializable_counts,
+        })
+
+        return Response(product_info, status=status.HTTP_200_OK)
+    
+
+# remove duuplicates
+def deduplicate_prediction(prediction: str) -> str:
+    import re
+
+    # Fix common model output noise
+    prediction = prediction.replace(" und ", ", ")   # German "and"
+    prediction = prediction.replace(";", ",")         # semicolons → commas
+    prediction = re.sub(r'\(.*?\)', '', prediction)   # remove anything in brackets
+    prediction = re.sub(r'\s+', ' ', prediction).strip()
+
+    parts = [part.strip() for part in prediction.split(",") if part.strip()]
+
+    seen = set()
+    unique_parts = []
+    for part in parts:
+        # Only keep valid "aspect: sentiment" pairs
+        if ":" in part:
+            try:
+                aspect, sentiment = part.rsplit(":", 1)
+                aspect = aspect.strip().lower()
+                sentiment = sentiment.strip().lower()
+                # Only keep if sentiment contains a known word
+                if any(s in sentiment for s in ['positive', 'negative', 'neutral', 'conflict']):
+                    key = f"{aspect}: {sentiment}"
+                    if key not in seen:
+                        seen.add(key)
+                        unique_parts.append(key)
+            except Exception:
+                continue
+
+    return ", ".join(unique_parts)
