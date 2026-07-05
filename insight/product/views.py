@@ -59,29 +59,56 @@ model = model.to(device)
 
 
 # ─── DEDUPLICATION ────────────────────────────────────────────────────────────
-def deduplicate_prediction(prediction: str) -> str:
-    prediction = prediction.replace(" und ", ", ")   # German "and"
-    prediction = prediction.replace(";", ",")         # semicolons -> commas
-    prediction = re.sub(r'\(.*?\)', '', prediction)   # remove anything in brackets
-    prediction = re.sub(r'\s+', ' ', prediction).strip()
+SENTIMENT_VOCAB = r'(?:extremely\s+positive|extremely\s+negative|positive|negative|neutral|conflict)'
+PAIR_RE = re.compile(rf'([^:,;]+):\s*({SENTIMENT_VOCAB})', re.IGNORECASE)
+CONNECTOR_PREFIX_RE = re.compile(r'^\s*(?:and|und|de|,|;)\s+', re.IGNORECASE)
+BRACKET_RE = re.compile(r'[()\[\]{}]')
 
-    parts = [part.strip() for part in prediction.split(",") if part.strip()]
+# Common synonyms/plurals the model uses for the same underlying aspect
+ASPECT_ALIASES = {
+    "colour": "color", "colours": "color", "colors": "color",
+    "fabrics": "fabric", "material": "fabric", "materials": "fabric",
+    "sizing": "size", "sizes": "size",
+    "designs": "design",
+    "zippers": "zipper",
+    "qualities": "quality",
+    "prices": "price", "pricing": "price",
+    "fits": "fit", "fitting": "fit",
+    "comforts": "comfort", "comfortable": "comfort",
+}
+
+
+def _normalize_aspect(raw_aspect: str) -> str:
+    aspect = CONNECTOR_PREFIX_RE.sub('', raw_aspect)
+    aspect = re.sub(r'\s+', ' ', aspect).strip(' .,:;')
+    aspect = aspect.lower()
+    return ASPECT_ALIASES.get(aspect, aspect)
+
+
+def deduplicate_prediction(prediction: str) -> str:
+    """
+    The T5 model doesn't always separate multiple aspect/sentiment pairs with a
+    clean comma - it sometimes uses 'and', 'de', 'und' as connectors, or wraps
+    a secondary aspect in parentheses like "fabric: positive (color: positive)".
+    We strip stray bracket characters (keeping their content, since it's often
+    a real extra aspect) and then extract every (aspect, sentiment) pair with a
+    regex anchored on the fixed sentiment vocabulary - instead of relying on
+    comma-splitting, which used to produce garbled combined aspect names.
+    """
+    # Drop bracket characters but keep what's inside them
+    prediction = BRACKET_RE.sub(' ', prediction)
 
     seen = set()
     unique_parts = []
-    for part in parts:
-        if ":" in part:
-            try:
-                aspect, sentiment = part.rsplit(":", 1)
-                aspect = aspect.strip().lower()
-                sentiment = sentiment.strip().lower()
-                if any(s in sentiment for s in ['positive', 'negative', 'neutral', 'conflict']):
-                    key = f"{aspect}: {sentiment}"
-                    if key not in seen:
-                        seen.add(key)
-                        unique_parts.append(key)
-            except Exception:
-                continue
+    for raw_aspect, raw_sentiment in PAIR_RE.findall(prediction):
+        aspect = _normalize_aspect(raw_aspect)
+        sentiment = raw_sentiment.strip().lower()
+        if not aspect:
+            continue
+        key = f"{aspect}: {sentiment}"
+        if key not in seen:
+            seen.add(key)
+            unique_parts.append(key)
 
     return ", ".join(unique_parts)
 
@@ -309,21 +336,8 @@ def scrape_product_reviews(product_link: str) -> Tuple[Optional[str], List[str]]
 
 # ─── SUMMARY GENERATOR ────────────────────────────────────────────────────────
 def generate_summary(extracted_aspects: List[str]) -> str:
+    total_reviews = len(extracted_aspects)
     aspect_sentiment_count = defaultdict(lambda: defaultdict(int))
-
-    def normalize_sentiment_local(sentiment: str) -> str:
-        sentiment = sentiment.strip().lower()
-        if "extremely positive" in sentiment:
-            return "extremely positive"
-        elif "extremely negative" in sentiment:
-            return "extremely negative"
-        elif "positive" in sentiment:
-            return "positive"
-        elif "negative" in sentiment:
-            return "negative"
-        elif "conflict" in sentiment:
-            return "conflict"
-        return "neutral"
 
     for aspect_string in extracted_aspects:
         for part in aspect_string.split(", "):
@@ -331,60 +345,72 @@ def generate_summary(extracted_aspects: List[str]) -> str:
                 try:
                     aspect, sentiment = part.rsplit(": ", 1)
                     aspect = aspect.strip().upper()
-                    normalized = normalize_sentiment_local(sentiment)
-                    aspect_sentiment_count[aspect][normalized] += 1
+                    aspect_sentiment_count[aspect][normalize_sentiment(sentiment)] += 1
                 except Exception:
                     continue
 
-    def classify(sentiments: dict) -> str:
-        total = sum(sentiments.values())
-        if total == 0:
-            return None
-        ext_pos = (sentiments.get("extremely positive", 0) / total) * 100
-        pos     = (sentiments.get("positive", 0) / total) * 100
-        neg     = (sentiments.get("negative", 0) / total) * 100
-        ext_neg = (sentiments.get("extremely negative", 0) / total) * 100
-        conflict = (sentiments.get("conflict", 0) / total) * 100
+    if not aspect_sentiment_count:
+        return "No clear sentiment patterns were found in the available reviews."
 
-        if conflict > 20:
-            return "conflicting"
-        elif ext_pos > 30:
-            return "very positive"
-        elif ext_neg > 30:
-            return "very negative"
-        elif (pos + ext_pos) > (neg + ext_neg + 10):
-            return "positive"
-        elif (neg + ext_neg) > (pos + ext_pos + 10):
-            return "negative"
-        elif total > 0:
-            return "mixed"
-        return None
-
-    categories = {
-        "very positive": [], "positive": [],
-        "negative": [],      "very negative": [],
-        "mixed": [],         "conflicting": []
-    }
+    # Net score per aspect (extreme sentiment weighted a bit heavier)
+    aspect_scores = {}
+    aspect_mention_totals = {}
     for aspect, sentiments in aspect_sentiment_count.items():
-        cat = classify(sentiments)
-        if cat:
-            categories[cat].append(aspect)
+        pos = sentiments.get("positive", 0) + sentiments.get("extremely positive", 0) * 1.5
+        neg = sentiments.get("negative", 0) + sentiments.get("extremely negative", 0) * 1.5
+        aspect_scores[aspect] = pos - neg
+        aspect_mention_totals[aspect] = sum(sentiments.values())
 
-    parts = []
-    if categories["very positive"]:
-        parts.append(f"Users were extremely enthusiastic about the {', '.join(categories['very positive'])}.")
-    if categories["positive"]:
-        parts.append(f"Many users found the {', '.join(categories['positive'])} to be good.")
-    if categories["mixed"]:
-        parts.append(f"Opinions on the {', '.join(categories['mixed'])} were mixed.")
-    if categories["conflicting"]:
-        parts.append(f"There were conflicting views about the {', '.join(categories['conflicting'])}.")
-    if categories["negative"]:
-        parts.append(f"Users reported issues with the {', '.join(categories['negative'])}.")
-    if categories["very negative"]:
-        parts.append(f"Users expressed strong concerns about the {', '.join(categories['very negative'])}.")
+    # Overall sentiment across every aspect mention (drives the opening verdict)
+    total_pos = sum(s.get("positive", 0) + s.get("extremely positive", 0) for s in aspect_sentiment_count.values())
+    total_neg = sum(s.get("negative", 0) + s.get("extremely negative", 0) for s in aspect_sentiment_count.values())
+    total_neutral = sum(s.get("neutral", 0) + s.get("conflict", 0) for s in aspect_sentiment_count.values())
+    total_mentions = total_pos + total_neg + total_neutral or 1
 
-    return " ".join(parts) if parts else "No clear sentiment patterns found."
+    pos_pct = round((total_pos / total_mentions) * 100)
+    neg_pct = round((total_neg / total_mentions) * 100)
+
+    if pos_pct >= 75:
+        verdict = "overwhelmingly positive"
+    elif pos_pct >= 60:
+        verdict = "positive"
+    elif neg_pct >= 60:
+        verdict = "largely negative"
+    elif neg_pct >= 40:
+        verdict = "mixed, leaning negative"
+    elif pos_pct - neg_pct >= 10:
+        verdict = "generally favorable, though mixed"
+    else:
+        verdict = "mixed"
+
+    review_word = "review" if total_reviews == 1 else "reviews"
+    opening = (
+        f"Based on {total_reviews} {review_word}, overall customer sentiment is {verdict} "
+        f"({pos_pct}% positive mentions vs {neg_pct}% negative)."
+    )
+
+    # Rank aspects by net score to find what's genuinely praised vs criticized
+    ranked = sorted(aspect_scores.items(), key=lambda x: x[1], reverse=True)
+    praised = [a for a, score in ranked if score > 0][:2]
+    criticized = [a for a, score in sorted(aspect_scores.items(), key=lambda x: x[1]) if score < 0][:2]
+    mixed = [
+        a for a, score in aspect_scores.items()
+        if abs(score) <= 1 and aspect_mention_totals[a] >= 3
+        and a not in praised and a not in criticized
+    ][:2]
+
+    sentences = [opening]
+
+    if praised:
+        sentences.append(f"Customers particularly liked the {', '.join(praised).lower()}.")
+    if criticized:
+        sentences.append(f"The main points of criticism were the {', '.join(criticized).lower()}.")
+    if mixed:
+        sentences.append(f"Opinions were split on the {', '.join(mixed).lower()}.")
+    if not praised and not criticized:
+        sentences.append("No single aspect stood out strongly in either direction.")
+
+    return " ".join(sentences)
 
 
 # ─── NORMALIZE SENTIMENT (shared helper) ──────────────────────────────────────
@@ -410,7 +436,7 @@ def _build_aspect_sentiment_counts(extracted_aspects: List[str]) -> dict:
             if ":" in part:
                 try:
                     aspect, sentiment = part.rsplit(": ", 1)
-                    aspect = aspect.strip()
+                    aspect = aspect.strip().title()
                     aspect_sentiment_counts[aspect][normalize_sentiment(sentiment)] += 1
                 except Exception:
                     continue
@@ -451,11 +477,11 @@ class ProductSearchOrScrapeView(APIView):
     # ------------------------------------------------------------------
     def _handle_url_query(self, request, url: str) -> Response:
         try:
-            product_name, reviews = scrape_product_reviews(url)
+            product_name, scraped_reviews = scrape_product_reviews(url)
 
             if product_name is None:
                 return Response(
-                    {"error": reviews[0] if reviews else "Failed to scrape product details"},
+                    {"error": scraped_reviews[0] if scraped_reviews else "Failed to scrape product details"},
                     status=status.HTTP_400_BAD_REQUEST
                 )
 
@@ -467,15 +493,23 @@ class ProductSearchOrScrapeView(APIView):
             )
             new_reviews = [
                 ProductReview(product=product, review_text=r)
-                for r in reviews if r not in existing_reviews
+                for r in scraped_reviews if r not in existing_reviews
             ]
             if new_reviews:
                 ProductReview.objects.bulk_create(new_reviews)
 
+            # Analyze the FULL set of reviews ever collected for this product,
+            # not just what was scraped in this one request - otherwise this
+            # response can disagree with what ProductDetailView shows later.
+            all_reviews = list(
+                ProductReview.objects.filter(product=product)
+                .values_list("review_text", flat=True)
+            )
+
             batch_size = 10
             all_extracted_aspects = []
-            for i in range(0, len(reviews), batch_size):
-                batch = reviews[i:i + batch_size]
+            for i in range(0, len(all_reviews), batch_size):
+                batch = all_reviews[i:i + batch_size]
                 all_extracted_aspects.extend(extract_aspect_sentiment(batch))
 
             summary_text = generate_summary(all_extracted_aspects)
@@ -487,7 +521,7 @@ class ProductSearchOrScrapeView(APIView):
                 "products": format_response([{
                     "id": product.id,
                     "name": product.name,
-                    "reviews": reviews,
+                    "reviews": all_reviews,
                     "extracted_aspects": all_extracted_aspects,
                     "aspect_sentiment_counts": _build_aspect_sentiment_counts(all_extracted_aspects),
                     "summary_text": summary_text
@@ -662,3 +696,19 @@ class ClearUserHistoryView(APIView):
     def delete(self, request):
         SearchHistory.objects.filter(user=request.user).delete()
         return Response({"message": "History cleared."}, status=status.HTTP_200_OK)
+    
+
+class DeleteHistoryItemView(APIView):
+    """Deletes one specific search-history entry, owned by the logged-in user."""
+    permission_classes = [IsAuthenticated]
+
+    def delete(self, request, history_id):
+        try:
+            entry = SearchHistory.objects.get(id=history_id, user=request.user)
+        except SearchHistory.DoesNotExist:
+            return Response(
+                {"error": "History entry not found."},
+                status=status.HTTP_404_NOT_FOUND
+            )
+        entry.delete()
+        return Response({"message": "History entry deleted."}, status=status.HTTP_200_OK)

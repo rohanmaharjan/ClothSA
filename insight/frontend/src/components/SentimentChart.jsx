@@ -1,25 +1,40 @@
 import {
   BarChart, Bar, XAxis, YAxis, Tooltip,
-  ResponsiveContainer, CartesianGrid,
+  ResponsiveContainer, CartesianGrid, ReferenceLine,
   PieChart, Pie, Cell,
 } from 'recharts'
 
 const COLORS = {
   positive: '#06b6d4',
   negative: '#f43f5e',
-  neutral:  '#475569',
+  neutral:  '#64748b',
 }
 
-const CustomTooltip = ({ active, payload, label }) => {
+const OverviewTooltip = ({ active, payload }) => {
   if (active && payload?.length) {
     return (
       <div className="bg-surface border border-border rounded-xl p-3 text-xs shadow-glowCard">
-        <p className="text-white font-semibold mb-2">{label}</p>
         {payload.map((p, i) => (
-          <p key={i} style={{ color: p.fill || p.color }} className="capitalize">
-            {p.name}: {p.value}{p.unit || ''}
+          <p key={i} style={{ color: p.payload.color }} className="capitalize">
+            {p.name}: {p.value}
           </p>
         ))}
+      </div>
+    )
+  }
+  return null
+}
+
+const DivergingTooltip = ({ active, payload, label }) => {
+  if (active && payload?.length) {
+    const row = payload[0]?.payload
+    if (!row) return null
+    return (
+      <div className="bg-surface border border-border rounded-xl p-3 text-xs shadow-glowCard">
+        <p className="text-white font-semibold mb-2">{label}</p>
+        <p style={{ color: COLORS.positive }}>Positive: {row.Positive}</p>
+        <p style={{ color: COLORS.neutral }}>Neutral: {row.Neutral}</p>
+        <p style={{ color: COLORS.negative }}>Negative: {Math.abs(row.Negative)}</p>
       </div>
     )
   }
@@ -29,27 +44,30 @@ const CustomTooltip = ({ active, payload, label }) => {
 export default function SentimentChart({ aspectSentimentCounts }) {
   if (!aspectSentimentCounts || Object.keys(aspectSentimentCounts).length === 0) return null
 
-  // ── Per-aspect counts, with totals for sorting/percentages ────────────────
+  // ── Per-aspect counts ──────────────────────────────────────────────────────
   const raw = Object.entries(aspectSentimentCounts).map(([aspect, sentiments]) => {
     const positive = (sentiments.positive || 0) + (sentiments['extremely positive'] || 0)
     const negative = (sentiments.negative || 0) + (sentiments['extremely negative'] || 0)
     const neutral  = (sentiments.neutral || 0) + (sentiments.conflict || 0)
-    const total = positive + negative + neutral
-    return { aspect, positive, negative, neutral, total }
+    return { aspect, positive, negative, neutral, net: positive - negative, total: positive + negative + neutral }
   }).filter(row => row.total > 0)
 
-  // Most-discussed aspects first, so the important stuff is on top
-  raw.sort((a, b) => b.total - a.total)
+  // Best aspects on top, worst at the bottom — reads like a ranked verdict
+  raw.sort((a, b) => b.net - a.net)
 
-  // 100%-stacked percentages, easier to compare aspects with very different review volumes
-  const stackedData = raw.map((row) => ({
+  const divergingData = raw.map((row) => ({
     aspect: row.aspect,
-    Positive: +((row.positive / row.total) * 100).toFixed(1),
-    Negative: +((row.negative / row.total) * 100).toFixed(1),
-    Neutral:  +((row.neutral  / row.total) * 100).toFixed(1),
+    Positive: row.positive,
+    Neutral: row.neutral,
+    Negative: -row.negative, // negative value so the bar extends left of center
   }))
 
-  // ── Overall totals for the summary donut + stat cards ──────────────────────
+  const maxAbs = Math.max(
+    1,
+    ...raw.map(r => Math.max(r.positive + r.neutral, r.negative))
+  )
+
+  // ── Overview totals for the donut + stat cards ─────────────────────────────
   const totals = raw.reduce(
     (acc, row) => {
       acc.positive += row.positive
@@ -68,7 +86,7 @@ export default function SentimentChart({ aspectSentimentCounts }) {
 
   const pctPositive = Math.round((totals.positive / grandTotal) * 100)
   const pctNegative = Math.round((totals.negative / grandTotal) * 100)
-  const topPraised   = raw.length ? [...raw].sort((a, b) => b.positive - a.positive)[0] : null
+  const topPraised   = raw.length ? raw[0] : null
   const topComplaint = raw.filter(r => r.negative > 0).sort((a, b) => b.negative - a.negative)[0]
 
   return (
@@ -97,7 +115,7 @@ export default function SentimentChart({ aspectSentimentCounts }) {
                     <Cell key={i} fill={entry.color} stroke="none" />
                   ))}
                 </Pie>
-                <Tooltip content={<CustomTooltip />} />
+                <Tooltip content={<OverviewTooltip />} />
               </PieChart>
             </ResponsiveContainer>
           </div>
@@ -121,36 +139,51 @@ export default function SentimentChart({ aspectSentimentCounts }) {
         </div>
       </div>
 
-      {/* ── Per-aspect 100% stacked breakdown, sorted by relevance ─────────── */}
+      {/* ── Diverging bar chart: praised vs criticized, ranked ─────────────── */}
       <div className="bg-card-gradient border border-border rounded-2xl p-6
                       shadow-glowCard hover:shadow-glow transition-shadow duration-300">
         <h3 className="text-white font-semibold mb-1 flex items-center gap-2">
-          <span className="text-cyan-400">📊</span> Aspect Sentiment Breakdown
+          <span className="text-cyan-400">📊</span> What People Liked vs. Disliked
         </h3>
         <p className="text-slate-500 text-xs mb-5">
-          Sorted by how often each aspect was mentioned. Bars show % positive / negative / neutral.
+          Ranked from most praised (top) to most criticized (bottom). Right side = positive + neutral, left side = negative.
         </p>
-        <ResponsiveContainer width="100%" height={Math.max(220, stackedData.length * 42)}>
+        <ResponsiveContainer width="100%" height={Math.max(220, divergingData.length * 46)}>
           <BarChart
-            data={stackedData}
+            data={divergingData}
             layout="vertical"
-            margin={{ top: 5, right: 20, left: 10, bottom: 5 }}
+            margin={{ top: 5, right: 40, left: 30, bottom: 5 }}
           >
             <CartesianGrid strokeDasharray="3 3" stroke="#2e2e2e" horizontal={false} />
-            <XAxis type="number" domain={[0, 100]} unit="%" tick={{ fill: '#94a3b8', fontSize: 11 }}
-                   axisLine={{ stroke: '#2e2e2e' }} tickLine={false} />
-            <YAxis type="category" dataKey="aspect" width={110}
-                   tick={{ fill: '#e2e8f0', fontSize: 11 }} axisLine={false} tickLine={false} />
-            <Tooltip content={<CustomTooltip />} cursor={{ fill: 'rgba(6,182,212,0.05)' }} />
-            <Bar dataKey="Positive" stackId="s" fill={COLORS.positive} unit="%" radius={[0, 0, 0, 0]} />
-            <Bar dataKey="Negative" stackId="s" fill={COLORS.negative} unit="%" radius={[0, 0, 0, 0]} />
-            <Bar dataKey="Neutral"  stackId="s" fill={COLORS.neutral}  unit="%" radius={[0, 4, 4, 0]} />
+            <XAxis
+              type="number"
+              domain={[-maxAbs, maxAbs]}
+              tick={{ fill: '#94a3b8', fontSize: 11 }}
+              axisLine={{ stroke: '#2e2e2e' }}
+              tickLine={false}
+              tickFormatter={(v) => Math.abs(v)}
+            />
+            <YAxis
+              type="category"
+              dataKey="aspect"
+              width={100}
+              tick={{ fill: '#e2e8f0', fontSize: 11 }}
+              axisLine={false}
+              tickLine={false}
+              tickFormatter={(v) => (v.length > 16 ? v.slice(0, 15) + '…' : v)}
+            />
+            <ReferenceLine x={0} stroke="#475569" />
+            <Tooltip content={<DivergingTooltip />} cursor={{ fill: 'rgba(6,182,212,0.05)' }} />
+
+            <Bar dataKey="Positive" stackId="right" fill={COLORS.positive} barSize={16} />
+            <Bar dataKey="Neutral" stackId="right" fill={COLORS.neutral} barSize={16} radius={[0, 3, 3, 0]} />
+            <Bar dataKey="Negative" fill={COLORS.negative} barSize={16} radius={[3, 0, 0, 3]} />
           </BarChart>
         </ResponsiveContainer>
         <div className="flex gap-5 mt-3 justify-center text-xs text-slate-500">
           <Legend color="bg-cyan-500" label="Positive" />
-          <Legend color="bg-rose-500" label="Negative" />
           <Legend color="bg-slate-500" label="Neutral" />
+          <Legend color="bg-rose-500" label="Negative" />
         </div>
       </div>
     </div>

@@ -5,6 +5,7 @@ from .views import (
     ProductDetailView,
     UserHistoryView,
     ClearUserHistoryView,
+    DeleteHistoryItemView,
 )
 
 urlpatterns = [
@@ -12,5 +13,6 @@ urlpatterns = [
     path('test/', AspectSentimentAnalysisView.as_view(), name='test-sentiment-analysis'),
     path('history/', UserHistoryView.as_view(), name='user-history'),
     path('history/clear/', ClearUserHistoryView.as_view(), name='clear-user-history'),
+    path('history/<int:history_id>/', DeleteHistoryItemView.as_view(), name='delete-history-item'),
     path('<int:product_id>/', ProductDetailView.as_view(), name='product-detail'),
 ]

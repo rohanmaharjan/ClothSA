@@ -19,3 +19,8 @@ export const clearUserHistory = async () => {
   const response = await axiosClient.delete('/product/history/clear/')
   return response.data
 }
+
+export const deleteHistoryItem = async (id) => {
+  const response = await axiosClient.delete(`/product/history/${id}/`)
+  return response.data
+}
