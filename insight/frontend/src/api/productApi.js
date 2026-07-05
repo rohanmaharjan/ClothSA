@@ -1,20 +1,21 @@
-import axios from 'axios'
-
-const BASE_URL = 'http://127.0.0.1:8000/api'
+import axiosClient from './axiosClient'
 
 export const searchOrScrape = async (input) => {
-    const response = await axios.post(`${BASE_URL}/product/`, 
-        { input },                          // ← body
-        {
-            headers: {
-                'Content-Type': 'application/json'
-            }
-        }
-    )
-    return response.data
+  const response = await axiosClient.post('/product/', { input })
+  return response.data
 }
 
 export const getProductDetail = async (id) => {
-    const response = await axios.get(`${BASE_URL}/product/${id}/`)
-    return response.data
+  const response = await axiosClient.get(`/product/${id}/`)
+  return response.data
+}
+
+export const getUserHistory = async () => {
+  const response = await axiosClient.get('/product/history/')
+  return response.data
+}
+
+export const clearUserHistory = async () => {
+  const response = await axiosClient.delete('/product/history/clear/')
+  return response.data
 }

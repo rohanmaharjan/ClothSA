@@ -11,7 +11,8 @@ from urllib.parse import unquote
 
 from rest_framework.views import APIView
 from rest_framework.response import Response
-from rest_framework import status, serializers
+from rest_framework import status, serializers, generics
+from rest_framework.permissions import IsAuthenticated
 from selenium import webdriver
 from selenium.webdriver.common.by import By
 from selenium.webdriver.edge.options import Options
@@ -22,8 +23,12 @@ from selenium.webdriver.edge.service import Service as EdgeService
 from transformers import T5ForConditionalGeneration, AutoTokenizer
 import torch
 
-from .models import Product, ProductReview
-from .serializers import ProductSerializer, ProductSearchInputSerializer
+from .models import Product, ProductReview, SearchHistory
+from .serializers import (
+    ProductSerializer,
+    ProductSearchInputSerializer,
+    SearchHistorySerializer,
+)
 from drf_spectacular.utils import extend_schema
 from dotenv import load_dotenv
 
@@ -55,13 +60,29 @@ model = model.to(device)
 
 # ─── DEDUPLICATION ────────────────────────────────────────────────────────────
 def deduplicate_prediction(prediction: str) -> str:
+    prediction = prediction.replace(" und ", ", ")   # German "and"
+    prediction = prediction.replace(";", ",")         # semicolons -> commas
+    prediction = re.sub(r'\(.*?\)', '', prediction)   # remove anything in brackets
+    prediction = re.sub(r'\s+', ' ', prediction).strip()
+
     parts = [part.strip() for part in prediction.split(",") if part.strip()]
+
     seen = set()
     unique_parts = []
     for part in parts:
-        if part not in seen:
-            seen.add(part)
-            unique_parts.append(part)
+        if ":" in part:
+            try:
+                aspect, sentiment = part.rsplit(":", 1)
+                aspect = aspect.strip().lower()
+                sentiment = sentiment.strip().lower()
+                if any(s in sentiment for s in ['positive', 'negative', 'neutral', 'conflict']):
+                    key = f"{aspect}: {sentiment}"
+                    if key not in seen:
+                        seen.add(key)
+                        unique_parts.append(key)
+            except Exception:
+                continue
+
     return ", ".join(unique_parts)
 
 
@@ -162,13 +183,11 @@ def scrape_product_reviews(product_link: str) -> Tuple[Optional[str], List[str]]
         page_title = driver.title.lower()
         print(f"Page title: {driver.title}")
 
-        # Check if blocked
         blocked_keywords = ["robot", "captcha", "sorry", "verify", "unusual traffic", "api gateway"]
         if any(k in page_title for k in blocked_keywords):
             print("BLOCKED BY AMAZON")
             return None, ["Amazon blocked the request"]
 
-        # Get product title
         title_selectors = ["#productTitle", "span#productTitle", "h1#title span", "h1"]
         product_name = None
         for selector in title_selectors:
@@ -187,7 +206,6 @@ def scrape_product_reviews(product_link: str) -> Tuple[Optional[str], List[str]]
         if not product_name:
             return None, ["Could not locate the product title"]
 
-        # ─── STRATEGY 1: Scroll down and find inline reviews ──
         print("Scrolling to load inline reviews on product page...")
         for scroll_pct in [0.3, 0.5, 0.7, 0.9, 1.0]:
             driver.execute_script(
@@ -195,7 +213,6 @@ def scrape_product_reviews(product_link: str) -> Tuple[Optional[str], List[str]]
             )
             time.sleep(1)
 
-        # ─── STRATEGY 2: Find and click the reviews section ───
         try:
             reviews_section = driver.find_element(
                 By.CSS_SELECTOR,
@@ -210,29 +227,20 @@ def scrape_product_reviews(product_link: str) -> Tuple[Optional[str], List[str]]
         except Exception:
             print("No reviews section anchor found, continuing with page scrape")
 
-        # ─── STRATEGY 3: Debug what data-hooks are available ──
-        # elements = driver.find_elements(By.CSS_SELECTOR, '[data-hook]')
-        # hooks = set([el.get_attribute('data-hook') for el in elements])
-        # print(f"Available data-hooks on product page: {hooks}")
-
-        # ─── TRY ALL KNOWN REVIEW SELECTORS ───────────────────
         review_selectors = [
-            # Inline product page review selectors
-            'span[data-hook="reviewText"]',          # ← exact hook from your debug
-            'div[data-hook="reviewTextContainer"]',   # ← exact hook from your debug
+            'span[data-hook="reviewText"]',
+            'div[data-hook="reviewTextContainer"]',
             'div[data-hook="reviewRichContentContainer"]',
             'div[data-hook="review"]',
             'div[data-hook="review-collapsed"]',
             'span[data-hook="review-body"]',
             'div[data-hook="review-body"]',
             '[data-hook="review-star-rating"] ~ div span',
-            # CSS class selectors
             '.review-text-content span',
             '.review-text span',
             '.reviewText span',
             'span.cr-original-review-content',
             '.a-expander-content p',
-            # Broader fallback
             '#cm_cr-review_list .review',
             '.customer-reviews-content',
         ]
@@ -250,13 +258,10 @@ def scrape_product_reviews(product_link: str) -> Tuple[Optional[str], List[str]]
             except TimeoutException:
                 continue
 
-        # ─── STRATEGY 4: Extract from full page text blocks ───
         if not review_elements:
             print("Trying full page text extraction...")
-            # Get all text from page and filter review-like content
             all_spans = driver.find_elements(By.TAG_NAME, 'span')
             all_paras = driver.find_elements(By.TAG_NAME, 'p')
-            all_divs  = driver.find_elements(By.TAG_NAME, 'div')
 
             candidates = all_spans + all_paras
             review_elements = [
@@ -265,7 +270,6 @@ def scrape_product_reviews(product_link: str) -> Tuple[Optional[str], List[str]]
             ]
             print(f"Full page extraction found {len(review_elements)} candidates")
 
-        # ─── CLEAN AND FILTER ─────────────────────────────────
         skip_keywords = [
             'sign in to see', 'write a review', 'filter by',
             'sort by', 'report abuse', 'see more reviews',
@@ -287,9 +291,6 @@ def scrape_product_reviews(product_link: str) -> Tuple[Optional[str], List[str]]
                 reviews.append(text)
 
         print(f"Total clean reviews: {len(reviews)}")
-        # if reviews:
-        #     for i, r in enumerate(reviews[:3]):
-        #         print(f"  Review {i+1}: {r[:80]}")
 
         if not reviews:
             return product_name, ["No customer reviews found on page"]
@@ -310,7 +311,7 @@ def scrape_product_reviews(product_link: str) -> Tuple[Optional[str], List[str]]
 def generate_summary(extracted_aspects: List[str]) -> str:
     aspect_sentiment_count = defaultdict(lambda: defaultdict(int))
 
-    def normalize_sentiment(sentiment: str) -> str:
+    def normalize_sentiment_local(sentiment: str) -> str:
         sentiment = sentiment.strip().lower()
         if "extremely positive" in sentiment:
             return "extremely positive"
@@ -330,7 +331,7 @@ def generate_summary(extracted_aspects: List[str]) -> str:
                 try:
                     aspect, sentiment = part.rsplit(": ", 1)
                     aspect = aspect.strip().upper()
-                    normalized = normalize_sentiment(sentiment)
+                    normalized = normalize_sentiment_local(sentiment)
                     aspect_sentiment_count[aspect][normalized] += 1
                 except Exception:
                     continue
@@ -402,16 +403,37 @@ def normalize_sentiment(sentiment: str) -> str:
     return "neutral"
 
 
+def _build_aspect_sentiment_counts(extracted_aspects: List[str]) -> dict:
+    aspect_sentiment_counts = defaultdict(lambda: defaultdict(int))
+    for aspect_string in extracted_aspects:
+        for part in aspect_string.split(", "):
+            if ":" in part:
+                try:
+                    aspect, sentiment = part.rsplit(": ", 1)
+                    aspect = aspect.strip()
+                    aspect_sentiment_counts[aspect][normalize_sentiment(sentiment)] += 1
+                except Exception:
+                    continue
+    return {aspect: dict(sentiments) for aspect, sentiments in aspect_sentiment_counts.items()}
+
+
+def _record_search_history(user, product: Product, query_input: str) -> None:
+    """Best-effort logging of a user's search; never breaks the main request."""
+    try:
+        SearchHistory.objects.create(user=user, product=product, query_input=query_input)
+    except Exception as e:
+        logger.error(f"Failed to record search history: {str(e)}")
+
+
 # ─── VIEWS ────────────────────────────────────────────────────────────────────
 class ProductSearchOrScrapeView(APIView):
+    permission_classes = [IsAuthenticated]
 
     @extend_schema(
         request=ProductSearchInputSerializer,
         responses={200: ProductSerializer},
     )
     def post(self, request):
-        print("REQUEST DATA:", request.data)        # ← add this
-        # print("REQUEST BODY:", request.body)        # ← add this
         user_input = request.data.get("input", "").strip()
 
         if not user_input:
@@ -420,17 +442,14 @@ class ProductSearchOrScrapeView(APIView):
                 status=status.HTTP_400_BAD_REQUEST
             )
 
-        print(user_input)
-
         if user_input.startswith(("http://", "https://")):
             user_input = unquote(user_input)
-            print(user_input)
-            return self._handle_url_query(user_input)
+            return self._handle_url_query(request, user_input)
 
-        return self._handle_search_query(user_input)
+        return self._handle_search_query(request, user_input)
 
     # ------------------------------------------------------------------
-    def _handle_url_query(self, url: str) -> Response:
+    def _handle_url_query(self, request, url: str) -> Response:
         try:
             product_name, reviews = scrape_product_reviews(url)
 
@@ -453,7 +472,6 @@ class ProductSearchOrScrapeView(APIView):
             if new_reviews:
                 ProductReview.objects.bulk_create(new_reviews)
 
-            # Aspect extraction in batches
             batch_size = 10
             all_extracted_aspects = []
             for i in range(0, len(reviews), batch_size):
@@ -462,12 +480,16 @@ class ProductSearchOrScrapeView(APIView):
 
             summary_text = generate_summary(all_extracted_aspects)
 
+            # Record history for the logged-in user
+            _record_search_history(request.user, product, url)
+
             return Response({
                 "products": format_response([{
                     "id": product.id,
                     "name": product.name,
                     "reviews": reviews,
                     "extracted_aspects": all_extracted_aspects,
+                    "aspect_sentiment_counts": _build_aspect_sentiment_counts(all_extracted_aspects),
                     "summary_text": summary_text
                 }])
             }, status=status.HTTP_200_OK)
@@ -484,7 +506,7 @@ class ProductSearchOrScrapeView(APIView):
             )
 
     # ------------------------------------------------------------------
-    def _handle_search_query(self, query: str) -> Response:
+    def _handle_search_query(self, request, query: str) -> Response:
         try:
             products = Product.objects.filter(name__icontains=query)
 
@@ -503,23 +525,7 @@ class ProductSearchOrScrapeView(APIView):
                 )
 
                 extracted_aspects = extract_aspect_sentiment(reviews) if reviews else []
-
-                # Count aspect sentiments
-                aspect_sentiment_counts = defaultdict(lambda: defaultdict(int))
-                for aspect_string in extracted_aspects:
-                    for part in aspect_string.split(", "):
-                        if ":" in part:
-                            try:
-                                aspect, sentiment = part.rsplit(": ", 1)
-                                aspect = aspect.strip()
-                                aspect_sentiment_counts[aspect][normalize_sentiment(sentiment)] += 1
-                            except Exception:
-                                continue
-
-                serializable_counts = {
-                    aspect: dict(sentiments)
-                    for aspect, sentiments in aspect_sentiment_counts.items()
-                }
+                serializable_counts = _build_aspect_sentiment_counts(extracted_aspects)
 
                 summary_text = (
                     generate_summary(extracted_aspects)
@@ -534,6 +540,9 @@ class ProductSearchOrScrapeView(APIView):
                     "summary_text": summary_text,
                 })
                 product_data.append(product_info)
+
+                # Record history for the logged-in user (one entry per matched product)
+                _record_search_history(request.user, product, query)
 
             return Response({"products": product_data}, status=status.HTTP_200_OK)
 
@@ -560,6 +569,7 @@ class AspectSentimentOutputSerializer(serializers.Serializer):
 
 
 class AspectSentimentAnalysisView(APIView):
+    permission_classes = [IsAuthenticated]
 
     @extend_schema(
         request=ReviewInputSerializer,
@@ -575,6 +585,7 @@ class AspectSentimentAnalysisView(APIView):
 
 # ─── PRODUCT DETAIL ───────────────────────────────────────────────────────────
 class ProductDetailView(APIView):
+    permission_classes = [IsAuthenticated]
 
     def get(self, request, product_id):
         try:
@@ -604,32 +615,18 @@ class ProductDetailView(APIView):
             )
 
         extracted_aspects = []
-        aspect_sentiment_counts = defaultdict(lambda: defaultdict(int))
+        serializable_counts = {}
 
         if reviews:
             try:
                 extracted_aspects = extract_aspect_sentiment(reviews)
-                for aspect_string in extracted_aspects:
-                    for part in aspect_string.split(", "):
-                        if ":" in part:
-                            try:
-                                aspect, sentiment = part.rsplit(": ", 1)
-                                aspect = aspect.strip()
-                                aspect_sentiment_counts[aspect][normalize_sentiment(sentiment)] += 1
-                            except ValueError:
-                                logger.warning(f"Skipping malformed aspect entry: {part}")
-                                continue
+                serializable_counts = _build_aspect_sentiment_counts(extracted_aspects)
             except Exception as e:
                 logger.error(f"Error extracting aspect sentiments: {str(e)}")
                 return Response(
                     {"error": "An error occurred while extracting aspect sentiments."},
                     status=status.HTTP_500_INTERNAL_SERVER_ERROR
                 )
-
-        serializable_counts = {
-            aspect: dict(sentiments)
-            for aspect, sentiments in aspect_sentiment_counts.items()
-        }
 
         product_info = ProductSerializer(product).data
         product_info.update({
@@ -639,36 +636,29 @@ class ProductDetailView(APIView):
         })
 
         return Response(product_info, status=status.HTTP_200_OK)
-    
 
-# remove duuplicates
-def deduplicate_prediction(prediction: str) -> str:
-    import re
 
-    # Fix common model output noise
-    prediction = prediction.replace(" und ", ", ")   # German "and"
-    prediction = prediction.replace(";", ",")         # semicolons → commas
-    prediction = re.sub(r'\(.*?\)', '', prediction)   # remove anything in brackets
-    prediction = re.sub(r'\s+', ' ', prediction).strip()
+# ─── USER SEARCH HISTORY ──────────────────────────────────────────────────────
+class UserHistoryView(generics.ListAPIView):
+    """
+    Returns the search history belonging ONLY to the currently authenticated
+    user - each account sees just its own list.
+    """
+    permission_classes = [IsAuthenticated]
+    serializer_class = SearchHistorySerializer
 
-    parts = [part.strip() for part in prediction.split(",") if part.strip()]
+    def get_queryset(self):
+        return (
+            SearchHistory.objects
+            .filter(user=self.request.user)
+            .select_related("product")
+        )
 
-    seen = set()
-    unique_parts = []
-    for part in parts:
-        # Only keep valid "aspect: sentiment" pairs
-        if ":" in part:
-            try:
-                aspect, sentiment = part.rsplit(":", 1)
-                aspect = aspect.strip().lower()
-                sentiment = sentiment.strip().lower()
-                # Only keep if sentiment contains a known word
-                if any(s in sentiment for s in ['positive', 'negative', 'neutral', 'conflict']):
-                    key = f"{aspect}: {sentiment}"
-                    if key not in seen:
-                        seen.add(key)
-                        unique_parts.append(key)
-            except Exception:
-                continue
 
-    return ", ".join(unique_parts)
+class ClearUserHistoryView(APIView):
+    """Deletes all search history entries for the logged-in user."""
+    permission_classes = [IsAuthenticated]
+
+    def delete(self, request):
+        SearchHistory.objects.filter(user=request.user).delete()
+        return Response({"message": "History cleared."}, status=status.HTTP_200_OK)
