@@ -1,6 +1,7 @@
 import os
 import re
 import time
+import json
 import logging
 import random
 from collections import defaultdict
@@ -200,7 +201,116 @@ def extract_aspect_sentiment(reviews: List[str]) -> List[str]:
 
 
 # ─── WEB SCRAPING ─────────────────────────────────────────────────────────────
-def scrape_product_reviews(product_link: str) -> Tuple[Optional[str], List[str]]:
+def extract_product_image(driver) -> Optional[str]:
+    """
+    Amazon's main product image is usually lazy-loaded, so the real high-res
+    URL often lives in an attribute (data-old-hires / data-a-dynamic-image)
+    rather than plain src. Try several strategies, best quality first.
+    """
+    image_selectors = [
+        "#landingImage",
+        "#imgTagWrapperId img",
+        "#main-image-container img",
+        "img[data-a-dynamic-image]",
+    ]
+
+    for selector in image_selectors:
+        try:
+            img = driver.find_element(By.CSS_SELECTOR, selector)
+        except NoSuchElementException:
+            continue
+
+        hires = img.get_attribute("data-old-hires")
+        if hires:
+            return hires
+
+        dynamic = img.get_attribute("data-a-dynamic-image")
+        if dynamic:
+            try:
+                urls = list(json.loads(dynamic).keys())
+                if urls:
+                    return urls[0]
+            except Exception:
+                pass
+
+        src = img.get_attribute("src")
+        if src and src.startswith("http"):
+            return src
+
+    return None
+
+
+def extract_product_price(driver) -> Optional[str]:
+    price_selectors = [
+        '.a-price .a-offscreen',
+        '#corePrice_feature_div .a-price .a-offscreen',
+        '#priceblock_ourprice',
+        '#priceblock_dealprice',
+        '#price_inside_buybox',
+        '.a-price-whole',
+    ]
+    for selector in price_selectors:
+        try:
+            el = driver.find_element(By.CSS_SELECTOR, selector)
+            text = (el.get_attribute('innerText') or el.text or '').strip()
+            if text:
+                return text
+        except NoSuchElementException:
+            continue
+        except Exception:
+            continue
+    return None
+
+
+def extract_product_sizes(driver) -> List[str]:
+    """
+    Amazon renders size options either as a <select> dropdown or as a row of
+    clickable swatch buttons, depending on the category/template - so we try
+    both patterns. Best-effort: returns an empty list if neither is found,
+    which is common on non-apparel or single-size listings.
+    """
+    sizes = []
+    seen = set()
+
+    try:
+        options = driver.find_elements(
+            By.CSS_SELECTOR,
+            '#native_dropdown_selected_size_name option, '
+            'select[name="dropdown_selected_size_name"] option'
+        )
+        for opt in options:
+            text = opt.text.strip()
+            if text and text.lower() not in ('select', 'select size', '') and text not in seen:
+                seen.add(text)
+                sizes.append(text)
+    except Exception:
+        pass
+
+    if not sizes:
+        try:
+            buttons = driver.find_elements(
+                By.CSS_SELECTOR,
+                '#variation_size_name li .a-button-text, '
+                '#variation_size_name .swatch-title-text-display, '
+                '#inline-twister-expanded-dimension-text-size_name'
+            )
+            for b in buttons:
+                text = b.text.strip()
+                if text and text not in seen:
+                    seen.add(text)
+                    sizes.append(text)
+        except Exception:
+            pass
+
+    return sizes[:15]
+
+
+def scrape_product_reviews(product_link: str) -> Tuple[Optional[dict], List[str]]:
+    """
+    Returns (product_info, reviews).
+    product_info is a dict: {"name", "image_url", "price", "sizes"} or None on failure.
+    On failure, reviews[0] contains the error message.
+    """
     driver = None
     try:
         driver = driver_manager.get_driver()
@@ -232,6 +342,11 @@ def scrape_product_reviews(product_link: str) -> Tuple[Optional[str], List[str]]
 
         if not product_name:
             return None, ["Could not locate the product title"]
+
+        image_url = extract_product_image(driver)
+        price = extract_product_price(driver)
+        sizes = extract_product_sizes(driver)
+        print(f"Found image URL: {image_url}, price: {price}, sizes: {sizes}")
 
         print("Scrolling to load inline reviews on product page...")
         for scroll_pct in [0.3, 0.5, 0.7, 0.9, 1.0]:
@@ -319,10 +434,17 @@ def scrape_product_reviews(product_link: str) -> Tuple[Optional[str], List[str]]
 
         print(f"Total clean reviews: {len(reviews)}")
 
-        if not reviews:
-            return product_name, ["No customer reviews found on page"]
+        product_info = {
+            "name": product_name,
+            "image_url": image_url,
+            "price": price,
+            "sizes": sizes,
+        }
 
-        return product_name, reviews
+        if not reviews:
+            return product_info, []
+
+        return product_info, reviews
 
     except TimeoutException as e:
         return None, [f"Timeout: {str(e)}"]
@@ -453,6 +575,12 @@ def _record_search_history(user, product: Product, query_input: str) -> None:
 
 # ─── VIEWS ────────────────────────────────────────────────────────────────────
 class ProductSearchOrScrapeView(APIView):
+    """
+    Scrapes/looks up a product and returns its overview (name, image, price,
+    sizes, raw reviews) WITHOUT running sentiment analysis - that's deferred
+    until the user explicitly hits GET /product/<id>/ (ProductDetailView),
+    which is where the T5 model actually runs.
+    """
     permission_classes = [IsAuthenticated]
 
     @extend_schema(
@@ -477,54 +605,60 @@ class ProductSearchOrScrapeView(APIView):
     # ------------------------------------------------------------------
     def _handle_url_query(self, request, url: str) -> Response:
         try:
-            product_name, scraped_reviews = scrape_product_reviews(url)
+            product_info, scraped_reviews = scrape_product_reviews(url)
 
-            if product_name is None:
+            if product_info is None:
                 return Response(
                     {"error": scraped_reviews[0] if scraped_reviews else "Failed to scrape product details"},
                     status=status.HTTP_400_BAD_REQUEST
                 )
 
-            product, _ = Product.objects.get_or_create(name=product_name)
+            product, _ = Product.objects.get_or_create(name=product_info["name"])
+
+            # Keep image/price/sizes fresh on every scrape (price especially can change)
+            product.image_url = product_info["image_url"] or product.image_url
+            product.price = product_info["price"] or product.price
+            product.sizes = product_info["sizes"] or product.sizes
+            product.save(update_fields=["image_url", "price", "sizes"])
+
+            IGNORED_REVIEW_TEXTS = {
+                "no customer reviews found on page",
+                "amazon blocked the request",
+                "could not locate the product title",
+            }
 
             existing_reviews = set(
                 ProductReview.objects.filter(product=product)
                 .values_list("review_text", flat=True)
             )
+
             new_reviews = [
                 ProductReview(product=product, review_text=r)
-                for r in scraped_reviews if r not in existing_reviews
+                for r in scraped_reviews
+                if r not in existing_reviews
+                and r.strip().lower() not in IGNORED_REVIEW_TEXTS
             ]
+
             if new_reviews:
                 ProductReview.objects.bulk_create(new_reviews)
 
-            # Analyze the FULL set of reviews ever collected for this product,
-            # not just what was scraped in this one request - otherwise this
-            # response can disagree with what ProductDetailView shows later.
             all_reviews = list(
                 ProductReview.objects.filter(product=product)
                 .values_list("review_text", flat=True)
             )
 
-            batch_size = 10
-            all_extracted_aspects = []
-            for i in range(0, len(all_reviews), batch_size):
-                batch = all_reviews[i:i + batch_size]
-                all_extracted_aspects.extend(extract_aspect_sentiment(batch))
-
-            summary_text = generate_summary(all_extracted_aspects)
-
-            # Record history for the logged-in user
             _record_search_history(request.user, product, url)
 
+            # No sentiment analysis here - the overview page shows this instantly,
+            # then the user explicitly triggers analysis via GET /product/<id>/
             return Response({
                 "products": format_response([{
                     "id": product.id,
                     "name": product.name,
+                    "image_url": product.image_url,
+                    "price": product.price,
+                    "sizes": product.sizes,
                     "reviews": all_reviews,
-                    "extracted_aspects": all_extracted_aspects,
-                    "aspect_sentiment_counts": _build_aspect_sentiment_counts(all_extracted_aspects),
-                    "summary_text": summary_text
                 }])
             }, status=status.HTTP_200_OK)
 
@@ -558,24 +692,10 @@ class ProductSearchOrScrapeView(APIView):
                     .values_list("review_text", flat=True)
                 )
 
-                extracted_aspects = extract_aspect_sentiment(reviews) if reviews else []
-                serializable_counts = _build_aspect_sentiment_counts(extracted_aspects)
-
-                summary_text = (
-                    generate_summary(extracted_aspects)
-                    if reviews else "No reviews available for sentiment analysis."
-                )
-
                 product_info = ProductSerializer(product).data
-                product_info.update({
-                    "reviews": reviews,
-                    "extracted_aspects": extracted_aspects,
-                    "aspect_sentiment_counts": serializable_counts,
-                    "summary_text": summary_text,
-                })
+                product_info["reviews"] = reviews
                 product_data.append(product_info)
 
-                # Record history for the logged-in user (one entry per matched product)
                 _record_search_history(request.user, product, query)
 
             return Response({"products": product_data}, status=status.HTTP_200_OK)
@@ -617,7 +737,7 @@ class AspectSentimentAnalysisView(APIView):
         return Response({"predictions": predictions}, status=status.HTTP_200_OK)
 
 
-# ─── PRODUCT DETAIL ───────────────────────────────────────────────────────────
+# ─── PRODUCT DETAIL (this is where sentiment analysis actually runs) ─────────
 class ProductDetailView(APIView):
     permission_classes = [IsAuthenticated]
 
@@ -650,11 +770,13 @@ class ProductDetailView(APIView):
 
         extracted_aspects = []
         serializable_counts = {}
+        summary_text = "No reviews available for sentiment analysis."
 
         if reviews:
             try:
                 extracted_aspects = extract_aspect_sentiment(reviews)
                 serializable_counts = _build_aspect_sentiment_counts(extracted_aspects)
+                summary_text = generate_summary(extracted_aspects)
             except Exception as e:
                 logger.error(f"Error extracting aspect sentiments: {str(e)}")
                 return Response(
@@ -667,6 +789,7 @@ class ProductDetailView(APIView):
             "reviews": reviews,
             "extracted_aspects": extracted_aspects,
             "aspect_sentiment_counts": serializable_counts,
+            "summary_text": summary_text,
         })
 
         return Response(product_info, status=status.HTTP_200_OK)
@@ -696,7 +819,7 @@ class ClearUserHistoryView(APIView):
     def delete(self, request):
         SearchHistory.objects.filter(user=request.user).delete()
         return Response({"message": "History cleared."}, status=status.HTTP_200_OK)
-    
+
 
 class DeleteHistoryItemView(APIView):
     """Deletes one specific search-history entry, owned by the logged-in user."""

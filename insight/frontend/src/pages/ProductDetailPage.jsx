@@ -27,7 +27,7 @@ export default function ProductDetailPage() {
         fetch()
     }, [id])
 
-    if (loading) return <div className="min-h-screen flex items-center justify-center"><Loader /></div>
+    if (loading) return <div className="min-h-screen flex items-center justify-center"><Loader message="Running sentiment analysis..." /></div>
     if (error)   return <div className="min-h-screen flex items-center justify-center text-red-400">{error}</div>
 
     return (
@@ -37,7 +37,35 @@ export default function ProductDetailPage() {
                 ← Back
             </button>
 
-            <h2 className="text-white font-bold text-2xl mb-6">{product.name}</h2>
+            <div className="flex flex-col sm:flex-row gap-5 mb-6">
+                {product.image_url && (
+                    <img
+                        src={product.image_url}
+                        alt={product.name}
+                        className="w-full sm:w-32 h-32 object-cover rounded-xl
+                                   border border-border bg-surface shrink-0"
+                        onError={(e) => { e.target.style.display = 'none' }}
+                    />
+                )}
+                <div>
+                    <h2 className="text-white font-bold text-2xl mb-2">{product.name}</h2>
+                    <div className="flex flex-wrap gap-2">
+                        {product.price && (
+                            <span className="bg-surface border border-border rounded-lg
+                                             px-3 py-1 text-cyan-400 text-sm font-semibold">
+                                {product.price}
+                            </span>
+                        )}
+                        {product.sizes?.map((size) => (
+                            <span key={size}
+                                  className="bg-surface border border-border rounded-md
+                                             px-2.5 py-1 text-slate-300 text-xs">
+                                {size}
+                            </span>
+                        ))}
+                    </div>
+                </div>
+            </div>
 
             <div className="space-y-6">
                 {/* Aspect badges */}
