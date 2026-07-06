@@ -51,7 +51,7 @@ export default function SearchPage() {
 
       {loading && (
         <div className="mt-10 relative z-10">
-          <Loader message="Scraping and analyzing reviews... this may take 30-40 seconds" />
+          <Loader message="Scraping product details and reviews..." />
         </div>
       )}
 
