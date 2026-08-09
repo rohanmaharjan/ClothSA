@@ -15,14 +15,14 @@ from rest_framework.response import Response
 from rest_framework import status, serializers, generics
 from rest_framework.permissions import IsAuthenticated
 from selenium import webdriver
+from selenium.webdriver.chrome.options import Options
+from selenium.webdriver.chrome.service import Service as ChromeService
 from selenium.webdriver.common.by import By
-from selenium.webdriver.edge.options import Options
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
 from selenium.common.exceptions import TimeoutException, NoSuchElementException
-from selenium.webdriver.edge.service import Service as EdgeService
-from transformers import T5ForConditionalGeneration, AutoTokenizer
-import torch
+from huggingface_hub import InferenceClient
+
 
 from .models import Product, ProductReview, SearchHistory
 from .serializers import (
@@ -47,16 +47,9 @@ def format_response(data):
 
 
 # ─── MODEL LOADING (once at startup) ──────────────────────────────────────────
-MODEL_PATH = os.getenv(
-    "MODEL_PATH",
-    os.path.join(os.path.dirname(__file__), "t5base")
-)
-model = T5ForConditionalGeneration.from_pretrained(MODEL_PATH, local_files_only=True)
-tokenizer = AutoTokenizer.from_pretrained(MODEL_PATH, local_files_only=True)
-model.eval()
-
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-model = model.to(device)
+MODEL_PATH = os.getenv("MODEL_PATH", "r0han1/clothsa-t5-aspect-sentiment")
+HF_TOKEN = os.getenv("HF_TOKEN")   # required even for public models, for rate-limit headroom
+hf_client = InferenceClient(model=MODEL_PATH, token=HF_TOKEN)
 
 
 # ─── DEDUPLICATION ────────────────────────────────────────────────────────────
@@ -125,13 +118,14 @@ class WebDriverManager:
 
     def __init__(self):
         if not hasattr(self, '_initialized'):
-            self.edge_options = self._configure_edge_options()
+            self.chrome_options = self._configure_chrome_options()
             self._initialized = True
 
     @staticmethod
-    def _configure_edge_options():
+    def _configure_chrome_options():
         options = Options()
-        options.add_argument("--headless")
+        options.binary_location = os.getenv("CHROME_BIN", "/usr/bin/chromium")
+        options.add_argument("--headless=new")
         options.add_argument("--disable-gpu")
         options.add_argument("--no-sandbox")
         options.add_argument("--disable-dev-shm-usage")
@@ -142,25 +136,21 @@ class WebDriverManager:
         options.add_experimental_option("excludeSwitches", ["enable-automation"])
         options.add_experimental_option("useAutomationExtension", False)
         options.add_argument(
-            "user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "user-agent=Mozilla/5.0 (X11; Linux x86_64) "
             "AppleWebKit/537.36 (KHTML, like Gecko) "
-            "Chrome/120.0.0.0 Safari/537.36 Edg/148.0.3967.96"
+            "Chrome/120.0.0.0 Safari/537.36"
         )
         return options
 
     def get_driver(self):
-        DRIVER_PATH = os.getenv(
-            "EDGE_DRIVER_PATH",
-            r"C:\WebDrivers\msedgedriver.exe"
-        )
+        DRIVER_PATH = os.getenv("CHROMEDRIVER_PATH", "/usr/bin/chromedriver")
         if not os.path.exists(DRIVER_PATH):
             raise RuntimeError(
-                f"Edge WebDriver not found at {DRIVER_PATH}. "
-                f"Download version 148.0.3967.96 from: "
-                f"https://developer.microsoft.com/en-us/microsoft-edge/tools/webdriver/"
+                f"Chromedriver not found at {DRIVER_PATH}. "
+                f"Set CHROMEDRIVER_PATH or check the Dockerfile's apt-get install."
             )
-        service = EdgeService(DRIVER_PATH)
-        return webdriver.Edge(service=service, options=self.edge_options)
+        service = ChromeService(DRIVER_PATH)
+        return webdriver.Chrome(service=service, options=self.chrome_options)
 
 
 driver_manager = WebDriverManager()
@@ -170,27 +160,22 @@ driver_manager = WebDriverManager()
 @lru_cache(maxsize=100)
 def extract_aspect_sentiment_cached(review: str) -> str:
     input_text = f"aspect-sentiment analysis: {review}"
-    input_encoding = tokenizer(
-        input_text,
-        return_tensors="pt",
-        padding=True,
-        truncation=True,
-        max_length=256
-    ).to(device)
-
-    with torch.no_grad():
-        output_ids = model.generate(
-            input_ids=input_encoding["input_ids"],
-            attention_mask=input_encoding["attention_mask"],
-            max_new_tokens=64,
-            num_beams=4,
-            do_sample=False,
-            early_stopping=True,
-            no_repeat_ngram_size=3,
-            repetition_penalty=2.5,
-        )
-
-    prediction = tokenizer.decode(output_ids[0], skip_special_tokens=True)
+    response = hf_client.post(
+        json={
+            "inputs": input_text,
+            "parameters": {
+                "max_new_tokens": 64,
+                "num_beams": 4,
+                "do_sample": False,
+                "early_stopping": True,
+                "no_repeat_ngram_size": 3,
+                "repetition_penalty": 2.5,
+            },
+            "options": {"wait_for_model": True},
+        }
+    )
+    result = json.loads(response)
+    prediction = result[0]["generated_text"]
     return deduplicate_prediction(prediction)
 
 
